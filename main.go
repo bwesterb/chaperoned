@@ -24,6 +24,7 @@ package main
 
 import (
 	"flag"
+	"io"
 	"log"
 	"net"
 )
@@ -38,9 +39,9 @@ const (
 
 type Connection struct {
 	id    int
-	csock net.Conn
-	gsock net.Conn
-	psock net.Conn
+	csock *net.TCPConn
+	gsock *net.TCPConn
+	psock *net.TCPConn
 
 	errors_chan         chan bool
 	client_buffers_chan chan []byte
@@ -52,9 +53,15 @@ var guardian_addr string
 var proxee_addr string
 var listen_addr string
 
+var res_proxee_addr *net.TCPAddr
+var res_guardian_addr *net.TCPAddr
+var res_listen_addr *net.TCPAddr
+
 var conns map[int]*Connection = make(map[int]*Connection)
 
 func main() {
+	var err error
+
 	// Parse cmdline flags
 	flag.StringVar(&listen_addr, "listen", "localhost:8080",
 		"Address to bind to, eg. localhost:8080")
@@ -64,17 +71,31 @@ func main() {
 		"Address of the guardian, eg. localhost:4321")
 	flag.Parse()
 
-	// Set up listen socket
-	l, err := net.Listen("tcp", listen_addr)
+	// Resolve addresses
+	res_listen_addr, err = net.ResolveTCPAddr("tcp", listen_addr)
 	if err != nil {
-		log.Fatalf("Failed to %v: %v", listen_addr, err)
+		log.Fatalf("Failed to resolve %v: %v", listen_addr, err)
+	}
+	res_guardian_addr, err = net.ResolveTCPAddr("tcp", guardian_addr)
+	if err != nil {
+		log.Fatalf("Failed to resolve %v: %v", guardian_addr, err)
+	}
+	res_proxee_addr, err = net.ResolveTCPAddr("tcp", proxee_addr)
+	if err != nil {
+		log.Fatalf("Failed to resolve %v: %v", proxee_addr, err)
+	}
+
+	// Set up listen socket
+	l, err := net.ListenTCP("tcp", res_listen_addr)
+	if err != nil {
+		log.Fatalf("Failed to bind to %v: %v", listen_addr, err)
 	}
 	defer l.Close()
 
 	// Accept connection
 	nconns := 0
 	for {
-		csock, err := l.Accept()
+		csock, err := l.AcceptTCP()
 		if err != nil {
 			log.Printf("Error accepting: %v", err)
 			continue
@@ -93,24 +114,24 @@ func main() {
 // to the proxee (and possibly guardian)
 func (c *Connection) RunClientReader() {
 	defer log.Printf("%v: RunClientReader returned", c.id)
-	var buffer []byte = make([]byte, 2048, 2048)
 
 	for {
+		buffer := make([]byte, 2048, 2048)
 		nread, err := c.csock.Read(buffer)
-		if err != nil {
-			log.Printf("%v: Failed to read from client: %v", c.id, err)
-			c.errors_chan <- true
-			return
-		}
 
 		if nread == 0 {
-			log.Printf("%v: Client closed connection", c.id)
+			log.Printf("%v: No bytes read: %v", c.id, err)
 			c.errors_chan <- true
 			return
 		}
 
 		c.client_buffers_chan <- buffer[:nread]
-		// TODO should we make a copy of buffer or is this fine?
+
+		if err != nil {
+			log.Printf("%v: Failed to read from client: %v", c.id, err)
+			c.errors_chan <- true
+			return
+		}
 	}
 }
 
@@ -120,21 +141,19 @@ func (c *Connection) RunGuardianDecisionReader() {
 	defer log.Printf("%v: RunGuardianDecisionReader returned", c.id)
 	buffer := make([]byte, 1, 1)
 	nread, err := c.gsock.Read(buffer)
-	if err != nil {
-		log.Printf("%v: Failed to read from guardian: %v", c.id, err)
-		c.guardian_decision_chan <- GDError
-		return
-	}
 	if nread == 0 {
-		log.Printf("%v: Guardian closed connection", c.id)
+		log.Printf("%v: Guardian closed connection: %v", c.id, err)
 		c.guardian_decision_chan <- GDError
 		return
 	}
-	if buffer[0] == 103 {
+	switch buffer[0] {
+	case 103:
 		c.guardian_decision_chan <- GDPassToGuardian
-	}
-	if buffer[0] == 112 {
+	case 112:
 		c.guardian_decision_chan <- GDPassToProxee
+	default:
+		log.Printf("%v: Guardian gave unrecognized decision: %v", buffer[0])
+		c.guardian_decision_chan <- GDError
 	}
 }
 
@@ -142,66 +161,26 @@ func (c *Connection) RunGuardianDecisionReader() {
 func (c *Connection) RunProxeeToClientPump() {
 	defer log.Printf("%v: RunProxeeToClientPump returned", c.id)
 	log.Printf("%v: passing to proxee", c.id)
-	buffer := make([]byte, 2048, 2048)
-	for {
-		nread, err := c.psock.Read(buffer)
-		if err != nil {
-			log.Printf("%v: Failed to read from proxee: %v", c.id, err)
-			c.errors_chan <- true
-			return
-		}
-
-		if nread == 0 {
-			log.Printf("%v: Proxee closed connection", c.id)
-			c.errors_chan <- true
-			return
-		}
-
-		offset := 0
-		for offset != nread {
-			nwritten, err := c.csock.Write(buffer[offset:nread])
-			if err != nil {
-				log.Printf("%v: Failed to write to client: %v", c.id, err)
-				c.errors_chan <- true
-				return
-			}
-			// TODO nwritten == 0
-			offset += nwritten
-		}
+	_, err := io.Copy(c.csock, c.psock)
+	if err == nil {
+		c.csock.CloseWrite()
+		return
 	}
+	log.Printf("%v: failed to pump from proxee to client: %v", c.id, err)
+	c.errors_chan <- true
 }
 
 // Pump data from the guardian to the client
 func (c *Connection) RunGuardianToClientPump() {
 	defer log.Printf("%v: RunGuardianToClientPump returned", c.id)
 	log.Printf("%v: passing to guardian", c.id)
-	buffer := make([]byte, 2048, 2048)
-	for {
-		nread, err := c.gsock.Read(buffer)
-		if err != nil {
-			log.Printf("%v: Failed to read from guardian: %v", c.id, err)
-			c.errors_chan <- true
-			return
-		}
-
-		if nread == 0 {
-			log.Printf("%v: Guardian closed connection", c.id)
-			c.errors_chan <- true
-			return
-		}
-
-		offset := 0
-		for offset != nread {
-			nwritten, err := c.csock.Write(buffer[offset:nread])
-			if err != nil {
-				log.Printf("%v: Failed to write to client: %v", c.id, err)
-				c.errors_chan <- true
-				return
-			}
-			// TODO nwritten == 0
-			offset += nwritten
-		}
+	_, err := io.Copy(c.csock, c.gsock)
+	if err == nil {
+		c.csock.CloseWrite()
+		return
 	}
+	log.Printf("%v: failed to pump from guardian to client: %v", c.id, err)
+	c.errors_chan <- true
 }
 
 func (c *Connection) Handle() {
@@ -212,7 +191,7 @@ func (c *Connection) Handle() {
 
 	log.Printf("%v: New connection from %v", c.id, c.csock.RemoteAddr())
 	log.Printf("%v: Connecting to proxee", c.id)
-	psock, err := net.Dial("tcp", proxee_addr)
+	psock, err := net.DialTCP("tcp", nil, res_proxee_addr)
 	if err != nil {
 		log.Printf("%v: Failed to connect to proxee: %v", c.id, err)
 		return
@@ -220,7 +199,7 @@ func (c *Connection) Handle() {
 	c.psock = psock
 	defer c.psock.Close()
 
-	gsock, err := net.Dial("tcp", guardian_addr)
+	gsock, err := net.DialTCP("tcp", nil, res_guardian_addr)
 	if err != nil {
 		log.Printf("%v: Failed to connect to guardian: %v", c.id, err)
 		return
