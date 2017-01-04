@@ -236,7 +236,8 @@ func (c *Connection) Handle() {
 	go c.RunClientReader()
 	go c.RunGuardianDecisionReader()
 
-	guardian_write_ok := true
+	write_to_guardian := true
+	write_to_proxee := true
 	for {
 		select {
 		case what := <-c.guardian_decision_chan:
@@ -244,19 +245,21 @@ func (c *Connection) Handle() {
 			case 0: // error
 				return
 			case 1: // pass to proxee
+				write_to_guardian = false
 				go c.RunProxeeToClientPump()
 			case 2: // pass to guardian
+				write_to_proxee = false
 				go c.RunGuardianToClientPump()
 			}
 		case buffer := <-c.client_buffers_chan:
 			offset := 0
 			// TODO make this async, so we notice an error on the errors_chan
 			//      earlier.
-			for offset != len(buffer) && guardian_write_ok {
+			for write_to_guardian && offset != len(buffer) {
 				nwritten, err := c.gsock.Write(buffer[offset:len(buffer)])
 				if err != nil {
 					log.Printf("%v: Failed to write to guardian: %v", c.id, err)
-					guardian_write_ok = false
+					write_to_guardian = false
 					break
 				}
 				// TODO nwritten can be 0?
@@ -264,7 +267,7 @@ func (c *Connection) Handle() {
 			}
 
 			offset = 0
-			for offset != len(buffer) {
+			for write_to_proxee && offset != len(buffer) {
 				nwritten, err := c.psock.Write(buffer[offset:len(buffer)])
 				if err != nil {
 					log.Printf("%v: Failed to write to proxee: %v", c.id, err)
@@ -272,6 +275,10 @@ func (c *Connection) Handle() {
 				}
 				// TODO nwritten can be 0?
 				offset += nwritten
+			}
+
+			if !write_to_guardian && !write_to_proxee {
+				return
 			}
 		case _ = <-c.errors_chan:
 			return
