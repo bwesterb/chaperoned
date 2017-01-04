@@ -26,9 +26,18 @@ import (
 	"net"
 )
 
+type Connection struct {
+	id    int
+	csock net.Conn
+	gsock net.Conn
+	psock net.Conn
+}
+
 var guardian_addr string
 var proxee_addr string
 var listen_addr string
+
+var conns map[int]*Connection = make(map[int]*Connection)
 
 func main() {
 	// Parse cmdline flags
@@ -48,34 +57,49 @@ func main() {
 	defer l.Close()
 
 	// Accept connection
+	nconns := 0
 	for {
-		conn, err := l.Accept()
+		csock, err := l.Accept()
 		if err != nil {
 			log.Printf("Error accepting: %v", err)
 			continue
 		}
 
-		go handleRequest(conn)
+		conn := &Connection{
+			id:    nconns,
+			csock: csock}
+		conns[nconns] = conn
+		go conn.Handle()
+		nconns++
 	}
 }
 
-func handleRequest(cconn net.Conn) {
-	defer cconn.Close()
+func (c *Connection) Deregister() {
+	log.Printf("%v: Deregistered", c.id)
+	delete(conns, c.id)
+}
 
-	log.Printf("Connecting to proxee for: %v", cconn.RemoteAddr())
-	pconn, err := net.Dial("tcp", proxee_addr)
+func (c *Connection) Handle() {
+	defer c.Deregister()
+	defer c.csock.Close()
+
+	log.Printf("%v: New connection from %v", c.id, c.csock.RemoteAddr())
+	log.Printf("%v: Connecting to proxee", c.id)
+	psock, err := net.Dial("tcp", proxee_addr)
 	if err != nil {
-		log.Printf("Failed to connect to proxee: %v", err)
+		log.Printf("%v: Failed to connect to proxee: %v", c.id, err)
 		return
 	}
-	defer pconn.Close()
+	c.psock = psock
+	defer c.psock.Close()
 
-	gconn, err := net.Dial("tcp", guardian_addr)
+	gsock, err := net.Dial("tcp", guardian_addr)
 	if err != nil {
-		log.Printf("Failed to connect to guardian: %v", err)
+		log.Printf("%v: Failed to connect to guardian: %v", c.id, err)
 		return
 	}
-	defer gconn.Close()
+	c.gsock = gsock
+	defer c.gsock.Close()
 
 	// 0: error
 	// 1: pass to proxee
@@ -90,15 +114,15 @@ func handleRequest(cconn net.Conn) {
 		var buffer []byte = make([]byte, 2048, 2048)
 
 		for {
-			nread, err := cconn.Read(buffer)
+			nread, err := c.csock.Read(buffer)
 			if err != nil {
-				log.Printf("Failed to read from client: %v", err)
+				log.Printf("%v: Failed to read from client: %v", c.id, err)
 				client_reader_error_chan <- true
 				return
 			}
 
 			if nread == 0 {
-				log.Printf("Client closed connection")
+				log.Printf("%v: Client closed connection", c.id)
 				client_reader_error_chan <- false
 				return
 			}
@@ -111,14 +135,14 @@ func handleRequest(cconn net.Conn) {
 	// Checking guardian response
 	go func() {
 		buffer := make([]byte, 1, 1)
-		nread, err := gconn.Read(buffer)
+		nread, err := c.gsock.Read(buffer)
 		if err != nil {
-			log.Printf("Failed to read from guardian: %v", err)
+			log.Printf("%v: Failed to read from guardian: %v", c.id, err)
 			guardian_reader_chan <- 0
 			return
 		}
 		if nread == 0 {
-			log.Printf("Guardian closed connection")
+			log.Printf("%v: Guardian closed connection", c.id)
 			guardian_reader_chan <- 0
 			return
 		}
@@ -138,28 +162,28 @@ func handleRequest(cconn net.Conn) {
 			case 0: // error
 				return
 			case 1: // pass to proxee
-				log.Printf("%v: passing to proxee", cconn.RemoteAddr())
+				log.Printf("%v: passing to proxee", c.id)
 				go func() {
 					buffer := make([]byte, 2048, 2048)
 					for {
-						nread, err := pconn.Read(buffer)
+						nread, err := c.psock.Read(buffer)
 						if err != nil {
-							log.Printf("Failed to read from proxee: %v", err)
+							log.Printf("%v: Failed to read from proxee: %v", c.id, err)
 							proxee_reader_error_chan <- true
 							return
 						}
 
 						if nread == 0 {
-							log.Printf("Proxee closed connection")
+							log.Printf("%v: Proxee closed connection", c.id)
 							proxee_reader_error_chan <- false
 							return
 						}
 
 						offset := 0
 						for offset != nread {
-							nwritten, err := cconn.Write(buffer[offset:nread])
+							nwritten, err := c.csock.Write(buffer[offset:nread])
 							if err != nil {
-								log.Printf("Failed to write to client: %v", err)
+								log.Printf("%v: Failed to write to client: %v", c.id, err)
 								proxee_reader_error_chan <- true
 								return
 							}
@@ -169,28 +193,28 @@ func handleRequest(cconn net.Conn) {
 					}
 				}()
 			case 2: // pass to guardian
-				log.Printf("%v: passing to guardian", cconn.RemoteAddr())
+				log.Printf("%v: passing to guardian", c.id)
 				go func() {
 					buffer := make([]byte, 2048, 2048)
 					for {
-						nread, err := gconn.Read(buffer)
+						nread, err := c.gsock.Read(buffer)
 						if err != nil {
-							log.Printf("Failed to read from guardian: %v", err)
+							log.Printf("%v: Failed to read from guardian: %v", c.id, err)
 							guardian_reader_error_chan <- true
 							return
 						}
 
 						if nread == 0 {
-							log.Printf("Guardian closed connection")
+							log.Printf("%v: Guardian closed connection", c.id)
 							guardian_reader_error_chan <- false
 							return
 						}
 
 						offset := 0
 						for offset != nread {
-							nwritten, err := cconn.Write(buffer[offset:nread])
+							nwritten, err := c.csock.Write(buffer[offset:nread])
 							if err != nil {
-								log.Printf("Failed to write to client: %v", err)
+								log.Printf("%v: Failed to write to client: %v", c.id, err)
 								guardian_reader_error_chan <- true
 								return
 							}
@@ -203,9 +227,9 @@ func handleRequest(cconn net.Conn) {
 		case buffer := <-client_reader_buffer_chan:
 			offset := 0
 			for offset != len(buffer) && guardian_write_ok {
-				nwritten, err := gconn.Write(buffer[offset:len(buffer)])
+				nwritten, err := c.gsock.Write(buffer[offset:len(buffer)])
 				if err != nil {
-					log.Printf("Failed to write to guardian: %v", err)
+					log.Printf("%v: Failed to write to guardian: %v", c.id, err)
 					guardian_write_ok = false
 					break
 				}
@@ -215,9 +239,9 @@ func handleRequest(cconn net.Conn) {
 
 			offset = 0
 			for offset != len(buffer) {
-				nwritten, err := pconn.Write(buffer[offset:len(buffer)])
+				nwritten, err := c.psock.Write(buffer[offset:len(buffer)])
 				if err != nil {
-					log.Printf("Failed to write to proxee: %v", err)
+					log.Printf("%v: Failed to write to proxee: %v", c.id, err)
 					return
 				}
 				// TODO nwritten can be 0?
