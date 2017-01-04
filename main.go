@@ -39,12 +39,12 @@ const (
 
 type Connection struct {
 	id    int
-	csock *net.TCPConn
-	gsock *net.TCPConn
-	psock *net.TCPConn
+	csock *net.TCPConn // socket to the client
+	gsock *net.TCPConn // socket to the guardian
+	psock *net.TCPConn // socket to the proxee
 
 	errors_chan         chan bool
-	client_buffers_chan chan []byte
+	client_buffers_chan chan []byte // buffers read from client
 
 	guardian_decision_chan chan GuardianDecision
 }
@@ -147,9 +147,9 @@ func (c *Connection) RunGuardianDecisionReader() {
 		return
 	}
 	switch buffer[0] {
-	case 103:
+	case 103: // g
 		c.guardian_decision_chan <- GDPassToGuardian
-	case 112:
+	case 112: // p
 		c.guardian_decision_chan <- GDPassToProxee
 	default:
 		log.Printf("%v: Guardian gave unrecognized decision: %v", buffer[0])
