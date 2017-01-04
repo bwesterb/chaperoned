@@ -31,6 +31,15 @@ type Connection struct {
 	csock net.Conn
 	gsock net.Conn
 	psock net.Conn
+
+	errors_chan         chan bool
+	client_buffers_chan chan []byte
+
+	// TODO make type
+	// 0: error
+	// 1: pass to proxee
+	// 2: pass to guardian
+	guardian_decision_chan chan int
 }
 
 var guardian_addr string
@@ -74,13 +83,119 @@ func main() {
 	}
 }
 
-func (c *Connection) Deregister() {
-	log.Printf("%v: Deregistered", c.id)
-	delete(conns, c.id)
+func (c *Connection) RunClientReader() {
+	defer log.Printf("%v: RunClientReader returned", c.id)
+	var buffer []byte = make([]byte, 2048, 2048)
+
+	for {
+		nread, err := c.csock.Read(buffer)
+		if err != nil {
+			log.Printf("%v: Failed to read from client: %v", c.id, err)
+			c.errors_chan <- true
+			return
+		}
+
+		if nread == 0 {
+			log.Printf("%v: Client closed connection", c.id)
+			c.errors_chan <- true
+			return
+		}
+
+		c.client_buffers_chan <- buffer[:nread]
+		// TODO should we make a copy of buffer or is this fine?
+	}
+}
+
+func (c *Connection) RunGuardianDecisionReader() {
+	defer log.Printf("%v: RunGuardianDecisionReader returned", c.id)
+	buffer := make([]byte, 1, 1)
+	nread, err := c.gsock.Read(buffer)
+	if err != nil {
+		log.Printf("%v: Failed to read from guardian: %v", c.id, err)
+		c.guardian_decision_chan <- 0
+		return
+	}
+	if nread == 0 {
+		log.Printf("%v: Guardian closed connection", c.id)
+		c.guardian_decision_chan <- 0
+		return
+	}
+	if buffer[0] == 103 {
+		c.guardian_decision_chan <- 2
+	}
+	if buffer[0] == 112 {
+		c.guardian_decision_chan <- 1
+	}
+}
+
+func (c *Connection) RunProxeeToClientPump() {
+	defer log.Printf("%v: RunProxeeToClientPump returned", c.id)
+	log.Printf("%v: passing to proxee", c.id)
+	buffer := make([]byte, 2048, 2048)
+	for {
+		nread, err := c.psock.Read(buffer)
+		if err != nil {
+			log.Printf("%v: Failed to read from proxee: %v", c.id, err)
+			c.errors_chan <- true
+			return
+		}
+
+		if nread == 0 {
+			log.Printf("%v: Proxee closed connection", c.id)
+			c.errors_chan <- true
+			return
+		}
+
+		offset := 0
+		for offset != nread {
+			nwritten, err := c.csock.Write(buffer[offset:nread])
+			if err != nil {
+				log.Printf("%v: Failed to write to client: %v", c.id, err)
+				c.errors_chan <- true
+				return
+			}
+			// TODO nwritten == 0
+			offset += nwritten
+		}
+	}
+}
+
+func (c *Connection) RunGuardianToClientPump() {
+	defer log.Printf("%v: RunGuardianToClientPump returned", c.id)
+	log.Printf("%v: passing to guardian", c.id)
+	buffer := make([]byte, 2048, 2048)
+	for {
+		nread, err := c.gsock.Read(buffer)
+		if err != nil {
+			log.Printf("%v: Failed to read from guardian: %v", c.id, err)
+			c.errors_chan <- true
+			return
+		}
+
+		if nread == 0 {
+			log.Printf("%v: Guardian closed connection", c.id)
+			c.errors_chan <- true
+			return
+		}
+
+		offset := 0
+		for offset != nread {
+			nwritten, err := c.csock.Write(buffer[offset:nread])
+			if err != nil {
+				log.Printf("%v: Failed to write to client: %v", c.id, err)
+				c.errors_chan <- true
+				return
+			}
+			// TODO nwritten == 0
+			offset += nwritten
+		}
+	}
 }
 
 func (c *Connection) Handle() {
-	defer c.Deregister()
+	// First, connect to proxee and guardian
+	defer log.Printf("%v: Handle returned", c.id)
+	defer delete(conns, c.id)
 	defer c.csock.Close()
 
 	log.Printf("%v: New connection from %v", c.id, c.csock.RemoteAddr())
@@ -101,130 +216,29 @@ func (c *Connection) Handle() {
 	c.gsock = gsock
 	defer c.gsock.Close()
 
-	// 0: error
-	// 1: pass to proxee
-	// 2: pass to guardian
-	guardian_reader_chan := make(chan int)
-	guardian_reader_error_chan := make(chan bool)
-	client_reader_error_chan := make(chan bool)
-	client_reader_buffer_chan := make(chan []byte)
-	proxee_reader_error_chan := make(chan bool)
+	// Set up channels
+	c.errors_chan = make(chan bool)
+	c.client_buffers_chan = make(chan []byte)
+	c.guardian_decision_chan = make(chan int)
 
-	go func() {
-		var buffer []byte = make([]byte, 2048, 2048)
+	// Start the workers
 
-		for {
-			nread, err := c.csock.Read(buffer)
-			if err != nil {
-				log.Printf("%v: Failed to read from client: %v", c.id, err)
-				client_reader_error_chan <- true
-				return
-			}
-
-			if nread == 0 {
-				log.Printf("%v: Client closed connection", c.id)
-				client_reader_error_chan <- false
-				return
-			}
-
-			client_reader_buffer_chan <- buffer[:nread]
-			// TODO should we make a copy of buffer or is this fine?
-		}
-	}()
-
-	// Checking guardian response
-	go func() {
-		buffer := make([]byte, 1, 1)
-		nread, err := c.gsock.Read(buffer)
-		if err != nil {
-			log.Printf("%v: Failed to read from guardian: %v", c.id, err)
-			guardian_reader_chan <- 0
-			return
-		}
-		if nread == 0 {
-			log.Printf("%v: Guardian closed connection", c.id)
-			guardian_reader_chan <- 0
-			return
-		}
-		if buffer[0] == 103 {
-			guardian_reader_chan <- 2
-		}
-		if buffer[0] == 112 {
-			guardian_reader_chan <- 1
-		}
-	}()
+	go c.RunClientReader()
+	go c.RunGuardianDecisionReader()
 
 	guardian_write_ok := true
 	for {
 		select {
-		case what := <-guardian_reader_chan:
+		case what := <-c.guardian_decision_chan:
 			switch what {
 			case 0: // error
 				return
 			case 1: // pass to proxee
-				log.Printf("%v: passing to proxee", c.id)
-				go func() {
-					buffer := make([]byte, 2048, 2048)
-					for {
-						nread, err := c.psock.Read(buffer)
-						if err != nil {
-							log.Printf("%v: Failed to read from proxee: %v", c.id, err)
-							proxee_reader_error_chan <- true
-							return
-						}
-
-						if nread == 0 {
-							log.Printf("%v: Proxee closed connection", c.id)
-							proxee_reader_error_chan <- false
-							return
-						}
-
-						offset := 0
-						for offset != nread {
-							nwritten, err := c.csock.Write(buffer[offset:nread])
-							if err != nil {
-								log.Printf("%v: Failed to write to client: %v", c.id, err)
-								proxee_reader_error_chan <- true
-								return
-							}
-							// TODO nwritten == 0
-							offset += nwritten
-						}
-					}
-				}()
+				go c.RunProxeeToClientPump()
 			case 2: // pass to guardian
-				log.Printf("%v: passing to guardian", c.id)
-				go func() {
-					buffer := make([]byte, 2048, 2048)
-					for {
-						nread, err := c.gsock.Read(buffer)
-						if err != nil {
-							log.Printf("%v: Failed to read from guardian: %v", c.id, err)
-							guardian_reader_error_chan <- true
-							return
-						}
-
-						if nread == 0 {
-							log.Printf("%v: Guardian closed connection", c.id)
-							guardian_reader_error_chan <- false
-							return
-						}
-
-						offset := 0
-						for offset != nread {
-							nwritten, err := c.csock.Write(buffer[offset:nread])
-							if err != nil {
-								log.Printf("%v: Failed to write to client: %v", c.id, err)
-								guardian_reader_error_chan <- true
-								return
-							}
-							// TODO nwritten == 0
-							offset += nwritten
-						}
-					}
-				}()
+				go c.RunGuardianToClientPump()
 			}
-		case buffer := <-client_reader_buffer_chan:
+		case buffer := <-c.client_buffers_chan:
 			offset := 0
 			for offset != len(buffer) && guardian_write_ok {
 				nwritten, err := c.gsock.Write(buffer[offset:len(buffer)])
@@ -247,12 +261,7 @@ func (c *Connection) Handle() {
 				// TODO nwritten can be 0?
 				offset += nwritten
 			}
-		case _ = <-client_reader_error_chan:
-			return
-		case _ = <-proxee_reader_error_chan:
-			return
-		case _ = <-guardian_reader_error_chan:
-			return
+		case _ = <-c.errors_chan:
 		default:
 			// ..
 		}
