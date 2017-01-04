@@ -1,4 +1,4 @@
-package main
+// TODO copyright-line
 
 // chaperoned is a simple single port TCP proxy with a twist --- the first
 // incoming bytes are copied to a guardian which has to give its blessings
@@ -15,9 +15,10 @@ package main
 //
 // chaperoned has several use cases.
 //
-//  1. It can be used to add Cookie-based authentication to a plain HTTP
-//     server.
+// 1. It can be used to add Cookie-based authentication to a plain HTTP
+//    server.
 //          ... TODO
+package main
 
 import (
 	"log"
