@@ -28,6 +28,14 @@ import (
 	"net"
 )
 
+type GuardianDecision int
+
+const (
+	GDError GuardianDecision = iota
+	GDPassToProxee
+	GDPassToGuardian
+)
+
 type Connection struct {
 	id    int
 	csock net.Conn
@@ -37,11 +45,7 @@ type Connection struct {
 	errors_chan         chan bool
 	client_buffers_chan chan []byte
 
-	// TODO make type
-	// 0: error
-	// 1: pass to proxee
-	// 2: pass to guardian
-	guardian_decision_chan chan int
+	guardian_decision_chan chan GuardianDecision
 }
 
 var guardian_addr string
@@ -118,19 +122,19 @@ func (c *Connection) RunGuardianDecisionReader() {
 	nread, err := c.gsock.Read(buffer)
 	if err != nil {
 		log.Printf("%v: Failed to read from guardian: %v", c.id, err)
-		c.guardian_decision_chan <- 0
+		c.guardian_decision_chan <- GDError
 		return
 	}
 	if nread == 0 {
 		log.Printf("%v: Guardian closed connection", c.id)
-		c.guardian_decision_chan <- 0
+		c.guardian_decision_chan <- GDError
 		return
 	}
 	if buffer[0] == 103 {
-		c.guardian_decision_chan <- 2
+		c.guardian_decision_chan <- GDPassToGuardian
 	}
 	if buffer[0] == 112 {
-		c.guardian_decision_chan <- 1
+		c.guardian_decision_chan <- GDPassToProxee
 	}
 }
 
@@ -229,7 +233,7 @@ func (c *Connection) Handle() {
 	// NOTE there can be at most three errors send to the errors_chan
 	c.errors_chan = make(chan bool, 3)
 	c.client_buffers_chan = make(chan []byte)
-	c.guardian_decision_chan = make(chan int)
+	c.guardian_decision_chan = make(chan GuardianDecision)
 
 	// Start the workers
 
@@ -242,12 +246,12 @@ func (c *Connection) Handle() {
 		select {
 		case what := <-c.guardian_decision_chan:
 			switch what {
-			case 0: // error
+			case GDError:
 				return
-			case 1: // pass to proxee
+			case GDPassToProxee:
 				write_to_guardian = false
 				go c.RunProxeeToClientPump()
-			case 2: // pass to guardian
+			case GDPassToGuardian:
 				write_to_proxee = false
 				go c.RunGuardianToClientPump()
 			}
