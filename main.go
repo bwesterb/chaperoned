@@ -1,4 +1,5 @@
-// TODO copyright-line
+// (c) 2017 - Bas Westerbaan <bas@westerbaan.name>
+// You may redistribute this file under the conditions of the GPLv3.
 
 // chaperoned is a simple single port TCP proxy with a twist --- the first
 // incoming bytes are copied to a guardian which has to give its blessings
@@ -15,9 +16,8 @@
 //
 // chaperoned has several use cases.
 //
-// 1. It can be used to add Cookie-based authentication to a plain HTTP
-//    server.
-//          ... TODO
+// 1. It can be used to add Cookie-based authentication to a plain HTTP server.
+// 2. ...
 package main
 
 // TODO splice!
@@ -245,7 +245,6 @@ func (c *Connection) Handle() {
 					write_to_guardian = false
 					break
 				}
-				// TODO nwritten can be 0?
 				offset += nwritten
 			}
 
@@ -256,7 +255,6 @@ func (c *Connection) Handle() {
 					log.Printf("%v: Failed to write to proxee: %v", c.id, err)
 					return
 				}
-				// TODO nwritten can be 0?
 				offset += nwritten
 			}
 
