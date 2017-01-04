@@ -21,22 +21,33 @@
 package main
 
 import (
+	"flag"
 	"log"
 	"net"
 )
 
-var guardian string = "localhost:4321"
-var proxee string = "google.com:80"
-var bind_to string = "localhost:8080"
+var guardian_addr string
+var proxee_addr string
+var listen_addr string
 
 func main() {
+	// Parse cmdline flags
+	flag.StringVar(&listen_addr, "listen", "localhost:8080",
+		"Address to bind to, eg. localhost:8080")
+	flag.StringVar(&proxee_addr, "proxee", "google.com:80",
+		"TCP service to be proxeed, eg. google.com:80")
+	flag.StringVar(&guardian_addr, "guardian", "localhost:4321",
+		"Address of the guardian, eg. localhost:4321")
+	flag.Parse()
 
-	l, err := net.Listen("tcp", bind_to)
+	// Set up listen socket
+	l, err := net.Listen("tcp", listen_addr)
 	if err != nil {
-		log.Fatalf("Failed to %v: %v", bind_to, err)
+		log.Fatalf("Failed to %v: %v", listen_addr, err)
 	}
 	defer l.Close()
 
+	// Accept connection
 	for {
 		conn, err := l.Accept()
 		if err != nil {
@@ -46,21 +57,20 @@ func main() {
 
 		go handleRequest(conn)
 	}
-
 }
 
 func handleRequest(cconn net.Conn) {
 	defer cconn.Close()
 
 	log.Printf("Connecting to proxee for: %v", cconn.RemoteAddr())
-	pconn, err := net.Dial("tcp", proxee)
+	pconn, err := net.Dial("tcp", proxee_addr)
 	if err != nil {
 		log.Printf("Failed to connect to proxee: %v", err)
 		return
 	}
 	defer pconn.Close()
 
-	gconn, err := net.Dial("tcp", guardian)
+	gconn, err := net.Dial("tcp", guardian_addr)
 	if err != nil {
 		log.Printf("Failed to connect to guardian: %v", err)
 		return
