@@ -20,6 +20,12 @@
 // 2. ...
 package main
 
+// TODO It might happen that the guardian decides to pass all data to itself,
+// which will force write_to_proxee == false.  However, this change of
+// write_to_proxee might not reach the RunWriter()-goroutine in time,
+// which might already copy the response of the client to the guardian
+// to the client.  Can we force write_to_proxee = false to be atomic?
+
 // TODO splice!
 
 import (
@@ -37,16 +43,25 @@ const (
 	GDPassToGuardian
 )
 
+type WorkerFeedback int
+
+const (
+	WFFatalError           WorkerFeedback = iota // some fatal error occured in a worker
+	WFDoNotWriteToGuardian                       // do not write to the guardian anymore
+)
+
 type Connection struct {
 	id    int
 	csock *net.TCPConn // socket to the client
 	gsock *net.TCPConn // socket to the guardian
 	psock *net.TCPConn // socket to the proxee
 
-	errors_chan         chan bool
-	client_buffers_chan chan []byte // buffers read from client
-
+	feedback_chan          chan WorkerFeedback
+	client_buffers_chan    chan []byte // buffers read from client
 	guardian_decision_chan chan GuardianDecision
+
+	write_to_guardian bool // copy client data to guardian
+	write_to_proxee   bool // copy client data to proxee
 }
 
 var guardian_addr string
@@ -102,8 +117,10 @@ func main() {
 		}
 
 		conn := &Connection{
-			id:    nconns,
-			csock: csock}
+			id:                nconns,
+			csock:             csock,
+			write_to_guardian: true,
+			write_to_proxee:   true}
 		conns[nconns] = conn
 		go conn.Handle()
 		nconns++
@@ -114,6 +131,7 @@ func main() {
 // to the proxee (and possibly guardian)
 func (c *Connection) RunClientReader() {
 	defer log.Printf("%v: RunClientReader returned", c.id)
+	defer close(c.client_buffers_chan)
 
 	for {
 		buffer := make([]byte, 2048, 2048)
@@ -121,7 +139,7 @@ func (c *Connection) RunClientReader() {
 
 		if nread == 0 {
 			log.Printf("%v: No bytes read: %v", c.id, err)
-			c.errors_chan <- true
+			c.feedback_chan <- WFFatalError
 			return
 		}
 
@@ -129,7 +147,7 @@ func (c *Connection) RunClientReader() {
 
 		if err != nil {
 			log.Printf("%v: Failed to read from client: %v", c.id, err)
-			c.errors_chan <- true
+			c.feedback_chan <- WFFatalError
 			return
 		}
 	}
@@ -167,7 +185,7 @@ func (c *Connection) RunProxeeToClientPump() {
 		return
 	}
 	log.Printf("%v: failed to pump from proxee to client: %v", c.id, err)
-	c.errors_chan <- true
+	c.feedback_chan <- WFFatalError
 }
 
 // Pump data from the guardian to the client
@@ -180,7 +198,37 @@ func (c *Connection) RunGuardianToClientPump() {
 		return
 	}
 	log.Printf("%v: failed to pump from guardian to client: %v", c.id, err)
-	c.errors_chan <- true
+	c.feedback_chan <- WFFatalError
+}
+
+// Write data read from client to guardian and proxee
+func (c *Connection) RunWriter() {
+	defer log.Printf("%v: RunWriter returned", c.id)
+	for c.write_to_guardian && c.write_to_proxee {
+		buffer := <-c.client_buffers_chan
+
+		offset := 0
+		for c.write_to_guardian && offset != len(buffer) {
+			nwritten, err := c.gsock.Write(buffer[offset:len(buffer)])
+			if err != nil {
+				log.Printf("%v: Failed to write to guardian: %v", c.id, err)
+				c.write_to_guardian = false
+				c.feedback_chan <- WFDoNotWriteToGuardian
+				break
+			}
+			offset += nwritten
+		}
+
+		offset = 0
+		for c.write_to_proxee && offset != len(buffer) {
+			nwritten, err := c.psock.Write(buffer[offset:len(buffer)])
+			if err != nil {
+				log.Printf("%v: Failed to write to proxee: %v", c.id, err)
+				return
+			}
+			offset += nwritten
+		}
+	}
 }
 
 func (c *Connection) Handle() {
@@ -209,18 +257,17 @@ func (c *Connection) Handle() {
 
 	// Set up channels
 
-	// NOTE there can be at most three errors send to the errors_chan
-	c.errors_chan = make(chan bool, 3)
-	c.client_buffers_chan = make(chan []byte)
+	// NOTE there can be at most five feedback messages send to the feedback_chan
+	c.feedback_chan = make(chan WorkerFeedback, 5)
 	c.guardian_decision_chan = make(chan GuardianDecision)
+	c.client_buffers_chan = make(chan []byte)
 
 	// Start the workers
 
 	go c.RunClientReader()
 	go c.RunGuardianDecisionReader()
+	go c.RunWriter()
 
-	write_to_guardian := true
-	write_to_proxee := true
 	for {
 		select {
 		case what := <-c.guardian_decision_chan:
@@ -228,40 +275,22 @@ func (c *Connection) Handle() {
 			case GDError:
 				return
 			case GDPassToProxee:
-				write_to_guardian = false
+				c.write_to_guardian = false
 				go c.RunProxeeToClientPump()
 			case GDPassToGuardian:
-				write_to_proxee = false
+				c.write_to_proxee = false
 				go c.RunGuardianToClientPump()
 			}
-		case buffer := <-c.client_buffers_chan:
-			offset := 0
-			// TODO make this async, so we notice an error on the errors_chan
-			//      earlier.
-			for write_to_guardian && offset != len(buffer) {
-				nwritten, err := c.gsock.Write(buffer[offset:len(buffer)])
-				if err != nil {
-					log.Printf("%v: Failed to write to guardian: %v", c.id, err)
-					write_to_guardian = false
-					break
-				}
-				offset += nwritten
-			}
 
-			offset = 0
-			for write_to_proxee && offset != len(buffer) {
-				nwritten, err := c.psock.Write(buffer[offset:len(buffer)])
-				if err != nil {
-					log.Printf("%v: Failed to write to proxee: %v", c.id, err)
-					return
-				}
-				offset += nwritten
-			}
-
-			if !write_to_guardian && !write_to_proxee {
+		case what := <-c.feedback_chan:
+			switch what {
+			case WFFatalError:
 				return
+			case WFDoNotWriteToGuardian:
+				c.write_to_guardian = false
 			}
-		case _ = <-c.errors_chan:
+		}
+		if !c.write_to_proxee && !c.write_to_guardian {
 			return
 		}
 	}
