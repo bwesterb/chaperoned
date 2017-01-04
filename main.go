@@ -20,6 +20,8 @@
 //          ... TODO
 package main
 
+// TODO splice!
+
 import (
 	"flag"
 	"log"
@@ -83,6 +85,8 @@ func main() {
 	}
 }
 
+// Reads buffers from the client to a channel, from which its written
+// to the proxee (and possibly guardian)
 func (c *Connection) RunClientReader() {
 	defer log.Printf("%v: RunClientReader returned", c.id)
 	var buffer []byte = make([]byte, 2048, 2048)
@@ -106,6 +110,8 @@ func (c *Connection) RunClientReader() {
 	}
 }
 
+// Reads the first byte send by the guardian which contains the
+// decision whether to connect the client to the proxee or guardian.
 func (c *Connection) RunGuardianDecisionReader() {
 	defer log.Printf("%v: RunGuardianDecisionReader returned", c.id)
 	buffer := make([]byte, 1, 1)
@@ -128,6 +134,7 @@ func (c *Connection) RunGuardianDecisionReader() {
 	}
 }
 
+// Pump data from the proxee to the client
 func (c *Connection) RunProxeeToClientPump() {
 	defer log.Printf("%v: RunProxeeToClientPump returned", c.id)
 	log.Printf("%v: passing to proxee", c.id)
@@ -160,6 +167,7 @@ func (c *Connection) RunProxeeToClientPump() {
 	}
 }
 
+// Pump data from the guardian to the client
 func (c *Connection) RunGuardianToClientPump() {
 	defer log.Printf("%v: RunGuardianToClientPump returned", c.id)
 	log.Printf("%v: passing to guardian", c.id)
@@ -242,6 +250,8 @@ func (c *Connection) Handle() {
 			}
 		case buffer := <-c.client_buffers_chan:
 			offset := 0
+			// TODO make this async, so we notice an error on the errors_chan
+			//      earlier.
 			for offset != len(buffer) && guardian_write_ok {
 				nwritten, err := c.gsock.Write(buffer[offset:len(buffer)])
 				if err != nil {
