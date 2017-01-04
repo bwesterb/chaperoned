@@ -217,7 +217,9 @@ func (c *Connection) Handle() {
 	defer c.gsock.Close()
 
 	// Set up channels
-	c.errors_chan = make(chan bool)
+
+	// NOTE there can be at most three errors send to the errors_chan
+	c.errors_chan = make(chan bool, 3)
 	c.client_buffers_chan = make(chan []byte)
 	c.guardian_decision_chan = make(chan int)
 
@@ -262,9 +264,7 @@ func (c *Connection) Handle() {
 				offset += nwritten
 			}
 		case _ = <-c.errors_chan:
-		default:
-			// ..
+			return
 		}
-
 	}
 }
