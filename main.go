@@ -20,12 +20,6 @@
 // 2. ...
 package main
 
-// TODO It might happen that the guardian decides to pass all data to itself,
-// which will force write_to_proxee == false.  However, this change of
-// write_to_proxee might not reach the RunWriter()-goroutine in time,
-// which might already copy the response of the client to the guardian
-// to the client.  Can we force write_to_proxee = false to be atomic?
-
 // TODO splice!
 
 import (
@@ -276,9 +270,11 @@ func (c *Connection) Handle() {
 				return
 			case GDPassToProxee:
 				c.write_to_guardian = false
+				c.gsock.Close()
 				go c.RunProxeeToClientPump()
 			case GDPassToGuardian:
 				c.write_to_proxee = false
+				c.psock.Close()
 				go c.RunGuardianToClientPump()
 			}
 
