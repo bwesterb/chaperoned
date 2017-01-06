@@ -213,8 +213,11 @@ func (c *Connection) RunGuardianToClientPump() {
 // Write data read from client to guardian and proxee
 func (c *Connection) RunWriter() {
 	defer log.Printf("%v: RunWriter returned", c.id)
-	for c.write_to_guardian && c.write_to_proxee {
-		buffer := <-c.client_buffers_chan
+	for c.write_to_guardian || c.write_to_proxee {
+		buffer, not_closed := <-c.client_buffers_chan
+		if !not_closed {
+			break
+		}
 
 		offset := 0
 		for c.write_to_guardian && offset != len(buffer) {
