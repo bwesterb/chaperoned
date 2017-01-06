@@ -67,6 +67,7 @@ var res_guardian_addr *net.TCPAddr
 var res_listen_addr *net.TCPAddr
 
 var conns map[int]*Connection = make(map[int]*Connection)
+var conn_closed_chan = make(chan int)
 
 func main() {
 	var err error
@@ -95,29 +96,43 @@ func main() {
 	}
 
 	// Set up listen socket
-	l, err := net.ListenTCP("tcp", res_listen_addr)
+	lsock, err := net.ListenTCP("tcp", res_listen_addr)
 	if err != nil {
 		log.Fatalf("Failed to bind to %v: %v", listen_addr, err)
 	}
-	defer l.Close()
+	defer lsock.Close()
 
-	// Accept connection
+	csock_chan := make(chan *net.TCPConn)
+	go RunAccepter(lsock, csock_chan)
+
 	nconns := 0
 	for {
-		csock, err := l.AcceptTCP()
+		select {
+		case csock := <-csock_chan:
+			conn := &Connection{
+				id:                nconns,
+				csock:             csock,
+				write_to_guardian: true,
+				write_to_proxee:   true}
+			conns[nconns] = conn
+			go conn.Handle()
+			nconns++
+		case id := <-conn_closed_chan:
+			delete(conns, id)
+			log.Printf("%v: Handle returned", id)
+		}
+	}
+}
+
+// Accepts incoming connections and passes them back through a channel
+func RunAccepter(lsock *net.TCPListener, schan chan<- *net.TCPConn) {
+	for {
+		csock, err := lsock.AcceptTCP()
 		if err != nil {
 			log.Printf("Error accepting: %v", err)
 			continue
 		}
-
-		conn := &Connection{
-			id:                nconns,
-			csock:             csock,
-			write_to_guardian: true,
-			write_to_proxee:   true}
-		conns[nconns] = conn
-		go conn.Handle()
-		nconns++
+		schan <- csock
 	}
 }
 
@@ -227,8 +242,7 @@ func (c *Connection) RunWriter() {
 
 func (c *Connection) Handle() {
 	// First, connect to proxee and guardian
-	defer log.Printf("%v: Handle returned", c.id)
-	defer delete(conns, c.id)
+	defer func() { conn_closed_chan <- c.id }()
 	defer c.csock.Close()
 
 	log.Printf("%v: New connection from %v", c.id, c.csock.RemoteAddr())
