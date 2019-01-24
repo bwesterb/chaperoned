@@ -179,7 +179,7 @@ func (c *Connection) RunGuardianDecisionReader() {
 	case 112: // p
 		c.guardian_decision_chan <- GDPassToProxee
 	default:
-		log.Printf("%v: Guardian gave unrecognized decision: %v", buffer[0])
+		log.Printf("%v: Guardian gave unrecognized decision: %v", c.id, buffer[0])
 		c.guardian_decision_chan <- GDError
 	}
 }
